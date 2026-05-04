@@ -414,8 +414,12 @@ scanner_<LoggerPolicy>::add_entry(std::filesystem::path const& name,
 
     return pe;
   } catch (const std::system_error& e) {
-    LOG_ERROR << "error reading entry: " << e.what();
-    prog.errors++;
+    if (e.code() == std::errc::no_such_file_or_directory) {
+      LOG_DEBUG << "skipping inaccessible entry: " << name.string();
+    } else {
+      LOG_ERROR << "error reading entry: " << e.what();
+      prog.errors++;
+    }
   }
 
   return nullptr;
