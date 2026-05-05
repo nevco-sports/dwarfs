@@ -441,38 +441,32 @@ scanner_<LoggerPolicy>::scan_tree(std::filesystem::path const& path,
     script_->transform(*root);
   }
 
-  std::deque<std::shared_ptr<entry>> queue({root});
+  // Queue stores (entry, absolute_path) pairs. On Windows with GCC 16,
+  // directory junctions appear as regular directories and the parent weak_ptr
+  // chain can become unreachable, causing fs_path() to return a bare filename.
+  // Calling directory_iterator with a relative path causes an Access Violation
+  // on MinGW. Tracking the absolute path alongside each entry avoids this.
+  using QueueEntry = std::pair<std::shared_ptr<entry>, std::filesystem::path>;
+  std::deque<QueueEntry> queue;
+  queue.push_back({root, path});
   prog.dirs_found++;
 
   while (!queue.empty()) {
-    auto parent = std::dynamic_pointer_cast<dir>(queue.front());
+    auto [parent_entry, parent_path] = queue.front();
+    queue.pop_front();
 
+    auto parent = std::dynamic_pointer_cast<dir>(parent_entry);
     DWARFS_CHECK(parent, "expected directory");
 
-    queue.pop_front();
-    auto path = parent->fs_path();
-
-#ifdef _WIN32
-    // On Windows with GCC 16, directory junctions may appear as regular
-    // directories but their parent entries can become unreachable, causing
-    // fs_path() to return a relative path (just the entry name). Calling
-    // directory_iterator with a relative path can cause an access violation
-    // on MinGW. Skip such entries to avoid crashing.
-    if (path.is_relative()) {
-      LOG_DEBUG << "skipping directory with inaccessible path: " << path;
-      continue;
-    }
-#endif
-
     try {
-      auto d = os_->opendir(path);
+      auto d = os_->opendir(parent_path);
       std::filesystem::path name;
-      std::vector<std::shared_ptr<entry>> subdirs;
+      std::vector<QueueEntry> subdirs;
 
       while (d->read(name)) {
         if (auto pe = add_entry(name, parent, prog, fs, debug_filter)) {
           if (pe->type() == entry::E_DIR) {
-            subdirs.push_back(pe);
+            subdirs.push_back({pe, parent_path / name.filename()});
           }
         }
       }
@@ -482,9 +476,9 @@ scanner_<LoggerPolicy>::scan_tree(std::filesystem::path const& path,
       prog.dirs_scanned++;
     } catch (const std::system_error& e) {
       if (e.code() == std::errc::no_such_file_or_directory) {
-        LOG_DEBUG << "skipping inaccessible directory: " << path;
+        LOG_DEBUG << "skipping inaccessible directory: " << parent_path;
       } else {
-        LOG_ERROR << "cannot read directory `" << path
+        LOG_ERROR << "cannot read directory `" << parent_path
                   << "`: " << folly::exceptionStr(e);
         prog.errors++;
       }
