@@ -452,6 +452,18 @@ scanner_<LoggerPolicy>::scan_tree(std::filesystem::path const& path,
     queue.pop_front();
     auto path = parent->fs_path();
 
+#ifdef _WIN32
+    // On Windows with GCC 16, directory junctions may appear as regular
+    // directories but their parent entries can become unreachable, causing
+    // fs_path() to return a relative path (just the entry name). Calling
+    // directory_iterator with a relative path can cause an access violation
+    // on MinGW. Skip such entries to avoid crashing.
+    if (path.is_relative()) {
+      LOG_DEBUG << "skipping directory with inaccessible path: " << path;
+      continue;
+    }
+#endif
+
     try {
       auto d = os_->opendir(path);
       std::filesystem::path name;
@@ -469,9 +481,13 @@ scanner_<LoggerPolicy>::scan_tree(std::filesystem::path const& path,
 
       prog.dirs_scanned++;
     } catch (const std::system_error& e) {
-      LOG_ERROR << "cannot read directory `" << path
-                << "`: " << folly::exceptionStr(e);
-      prog.errors++;
+      if (e.code() == std::errc::no_such_file_or_directory) {
+        LOG_DEBUG << "skipping inaccessible directory: " << path;
+      } else {
+        LOG_ERROR << "cannot read directory `" << path
+                  << "`: " << folly::exceptionStr(e);
+        prog.errors++;
+      }
     }
   }
 
