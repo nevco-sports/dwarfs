@@ -371,8 +371,10 @@ scanner_<LoggerPolicy>::add_entry(std::filesystem::path const& name,
         break;
       }
 
-      parent->add(pe);
-
+      // Scan before adding to parent: if scan throws (e.g. NTFS junction
+      // readlink failure on Windows), pe is not yet in parent's child list,
+      // preventing the partial-add corruption that causes SIGSEGV during
+      // inode assignment.
       switch (pe->type()) {
       case entry::E_DIR:
         // prog.current.store(pe.get());
@@ -410,6 +412,8 @@ scanner_<LoggerPolicy>::add_entry(std::filesystem::path const& name,
         prog.errors++;
         break;
       }
+
+      parent->add(pe);
     }
 
     return pe;
@@ -828,3 +832,4 @@ scanner::scanner(logger& lgr, worker_group& wg,
           options)) {}
 
 } // namespace dwarfs
+
