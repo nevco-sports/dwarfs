@@ -424,6 +424,12 @@ scanner_<LoggerPolicy>::add_entry(std::filesystem::path const& name,
       LOG_ERROR << "error reading entry: " << e.what();
       prog.errors++;
     }
+  } catch (const std::exception& e) {
+    LOG_ERROR << "unexpected error for entry " << name.string() << ": " << e.what();
+    prog.errors++;
+  } catch (...) {
+    LOG_ERROR << "unknown error for entry " << name.string();
+    prog.errors++;
   }
 
   return nullptr;
@@ -482,10 +488,18 @@ scanner_<LoggerPolicy>::scan_tree(std::filesystem::path const& path,
       if (e.code() == std::errc::no_such_file_or_directory) {
         LOG_DEBUG << "skipping inaccessible directory: " << parent_path;
       } else {
-        LOG_ERROR << "cannot read directory `" << parent_path
-                  << "`: " << folly::exceptionStr(e);
+        LOG_WARN << "cannot read directory `" << parent_path
+                 << "`: " << e.what() << " (skipping)";
         prog.errors++;
       }
+    } catch (const std::exception& e) {
+      LOG_WARN << "unexpected error reading directory `" << parent_path
+               << "`: " << e.what() << " (skipping)";
+      prog.errors++;
+    } catch (...) {
+      LOG_WARN << "unknown error reading directory `" << parent_path
+               << "` (skipping)";
+      prog.errors++;
     }
   }
 
@@ -832,4 +846,3 @@ scanner::scanner(logger& lgr, worker_group& wg,
           options)) {}
 
 } // namespace dwarfs
-

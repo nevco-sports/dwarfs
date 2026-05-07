@@ -19,6 +19,7 @@
  * along with dwarfs.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+#include <cstdio>
 #include <mutex>
 #include <string_view>
 #include <vector>
@@ -258,32 +259,42 @@ void file_scanner_::scan_dedupe(file* p) {
 
     // Add a job for any subsequent files
     wg_.add_job([this, p, cv] {
-      hash_file(p);
+      try {
+        hash_file(p);
 
-      {
-        std::unique_lock lock(mx_);
+        {
+          std::unique_lock lock(mx_);
 
-        if (cv) {
-          // Wait until the first file of this size has been added to
-          // `by_hash_`.
-          cv->wait(lock);
+          if (cv) {
+            // Wait until the first file of this size has been added to
+            // `by_hash_`.
+            cv->wait(lock);
+          }
+
+          auto& ref = by_hash_[p->hash()];
+
+          if (ref.empty()) {
+            // This is *not* a duplicate. We must allocate a new inode.
+            add_inode(p);
+          } else {
+            auto inode = ref.front()->get_inode();
+            assert(inode);
+            p->set_inode(inode);
+            ++prog_.files_scanned;
+            ++prog_.duplicate_files;
+            prog_.saved_by_deduplication += p->size();
+          }
+
+          ref.push_back(p);
         }
-
-        auto& ref = by_hash_[p->hash()];
-
-        if (ref.empty()) {
-          // This is *not* a duplicate. We must allocate a new inode.
-          add_inode(p);
-        } else {
-          auto inode = ref.front()->get_inode();
-          assert(inode);
-          p->set_inode(inode);
-          ++prog_.files_scanned;
-          ++prog_.duplicate_files;
-          prog_.saved_by_deduplication += p->size();
-        }
-
-        ref.push_back(p);
+      } catch (const std::exception& e) {
+        fprintf(stderr, "error scanning file %s: %s (skipping)\n",
+                p->path_as_string().c_str(), e.what());
+        prog_.errors++;
+      } catch (...) {
+        fprintf(stderr, "unknown error scanning file %s (skipping)\n",
+                p->path_as_string().c_str());
+        prog_.errors++;
       }
     });
   }
@@ -310,16 +321,26 @@ void file_scanner_::add_inode(file* p) {
 
   if (ino_opts_.needs_scan(p->size())) {
     wg_.add_job([this, p, inode = std::move(inode)] {
-      std::shared_ptr<mmif> mm;
-      auto const size = p->size();
-      if (size > 0) {
-        mm = os_.map_file(p->fs_path(), size);
+      try {
+        std::shared_ptr<mmif> mm;
+        auto const size = p->size();
+        if (size > 0) {
+          mm = os_.map_file(p->fs_path(), size);
+        }
+        inode->scan(mm.get(), ino_opts_);
+        ++prog_.similarity_scans;
+        prog_.similarity_bytes += size;
+        ++prog_.inodes_scanned;
+        ++prog_.files_scanned;
+      } catch (const std::exception& e) {
+        fprintf(stderr, "error scanning inode for %s: %s (skipping)\n",
+                p->path_as_string().c_str(), e.what());
+        prog_.errors++;
+      } catch (...) {
+        fprintf(stderr, "unknown error scanning inode for %s (skipping)\n",
+                p->path_as_string().c_str());
+        prog_.errors++;
       }
-      inode->scan(mm.get(), ino_opts_);
-      ++prog_.similarity_scans;
-      prog_.similarity_bytes += size;
-      ++prog_.inodes_scanned;
-      ++prog_.files_scanned;
     });
   } else {
     inode->set_similarity_valid(ino_opts_);
