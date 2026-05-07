@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <deque>
@@ -687,9 +688,20 @@ void scanner_<LoggerPolicy>::scan(
         im.order_inodes(script_, options_.file_order,
                         [&](std::shared_ptr<inode> const& ino) {
                           blockify.add_job([&] {
-                            prog.current.store(ino.get());
-                            bm.add_inode(ino);
-                            prog.inodes_written++;
+                            try {
+                              prog.current.store(ino.get());
+                              bm.add_inode(ino);
+                              prog.inodes_written++;
+                            } catch (const std::exception& e) {
+                              fprintf(stderr,
+                                      "error blockifying inode: %s (skipping)\n",
+                                      e.what());
+                              prog.errors++;
+                            } catch (...) {
+                              fprintf(stderr,
+                                      "unknown error blockifying inode (skipping)\n");
+                              prog.errors++;
+                            }
                           });
                           auto queued_files = blockify.queue_size();
                           auto queued_blocks = fsw.queue_fill();
