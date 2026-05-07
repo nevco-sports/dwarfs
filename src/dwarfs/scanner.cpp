@@ -658,21 +658,29 @@ void scanner_<LoggerPolicy>::scan(
   LOG_INFO << "building metadata...";
 
   wg_.add_job([&] {
-    LOG_INFO << "saving names and symlinks...";
-    names_and_symlinks_visitor nlv(ge_data);
-    root->accept(nlv);
+    try {
+      LOG_INFO << "saving names and symlinks...";
+      names_and_symlinks_visitor nlv(ge_data);
+      root->accept(nlv);
 
-    ge_data.index();
+      ge_data.index();
 
-    LOG_INFO << "updating name and link indices...";
-    root->walk([&](entry* ep) {
-      ep->update(ge_data);
-      if (auto lp = dynamic_cast<link*>(ep)) {
-        DWARFS_NOTHROW(mv2.symlink_table()->at(ep->inode_num().value() -
-                                               first_link_inode)) =
-            ge_data.get_symlink_table_entry(lp->linkname());
-      }
-    });
+      LOG_INFO << "updating name and link indices...";
+      root->walk([&](entry* ep) {
+        ep->update(ge_data);
+        if (auto lp = dynamic_cast<link*>(ep)) {
+          DWARFS_NOTHROW(mv2.symlink_table()->at(ep->inode_num().value() -
+                                                 first_link_inode)) =
+              ge_data.get_symlink_table_entry(lp->linkname());
+        }
+      });
+    } catch (const std::exception& e) {
+      fprintf(stderr, "error building metadata: %s (skipping)\n", e.what());
+      prog.errors++;
+    } catch (...) {
+      fprintf(stderr, "unknown error building metadata (skipping)\n");
+      prog.errors++;
+    }
   });
 
   LOG_INFO << "building blocks...";
@@ -685,31 +693,39 @@ void scanner_<LoggerPolicy>::scan(
       worker_group ordering("ordering", 1);
 
       ordering.add_job([&] {
-        im.order_inodes(script_, options_.file_order,
-                        [&](std::shared_ptr<inode> const& ino) {
-                          blockify.add_job([&] {
-                            try {
-                              prog.current.store(ino.get());
-                              bm.add_inode(ino);
-                              prog.inodes_written++;
-                            } catch (const std::exception& e) {
-                              fprintf(stderr,
-                                      "error blockifying inode: %s (skipping)\n",
-                                      e.what());
-                              prog.errors++;
-                            } catch (...) {
-                              fprintf(stderr,
-                                      "unknown error blockifying inode (skipping)\n");
-                              prog.errors++;
-                            }
+        try {
+          im.order_inodes(script_, options_.file_order,
+                          [&](std::shared_ptr<inode> const& ino) {
+                            blockify.add_job([&] {
+                              try {
+                                prog.current.store(ino.get());
+                                bm.add_inode(ino);
+                                prog.inodes_written++;
+                              } catch (const std::exception& e) {
+                                fprintf(stderr,
+                                        "error blockifying inode: %s (skipping)\n",
+                                        e.what());
+                                prog.errors++;
+                              } catch (...) {
+                                fprintf(stderr,
+                                        "unknown error blockifying inode (skipping)\n");
+                                prog.errors++;
+                              }
+                            });
+                            auto queued_files = blockify.queue_size();
+                            auto queued_blocks = fsw.queue_fill();
+                            prog.blockify_queue = queued_files;
+                            prog.compress_queue = queued_blocks;
+                            return INT64_C(500) * queued_blocks +
+                                   static_cast<int64_t>(queued_files);
                           });
-                          auto queued_files = blockify.queue_size();
-                          auto queued_blocks = fsw.queue_fill();
-                          prog.blockify_queue = queued_files;
-                          prog.compress_queue = queued_blocks;
-                          return INT64_C(500) * queued_blocks +
-                                 static_cast<int64_t>(queued_files);
-                        });
+        } catch (const std::exception& e) {
+          fprintf(stderr, "error ordering inodes: %s (skipping)\n", e.what());
+          prog.errors++;
+        } catch (...) {
+          fprintf(stderr, "unknown error ordering inodes (skipping)\n");
+          prog.errors++;
+        }
       });
 
       ordering.wait();
