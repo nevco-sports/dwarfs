@@ -234,21 +234,41 @@ void file_scanner_::scan_dedupe(file* p) {
 
       // Add a job for the first file
       wg_.add_job([this, p = it->second.front(), cv] {
-        hash_file(p);
+        try {
+          hash_file(p);
 
-        {
-          std::lock_guard lock(mx_);
+          {
+            std::lock_guard lock(mx_);
 
-          auto& ref = by_hash_[p->hash()];
+            auto& ref = by_hash_[p->hash()];
 
-          assert(ref.empty());
-          assert(p->get_inode());
+            assert(ref.empty());
+            assert(p->get_inode());
 
-          ref.push_back(p);
+            ref.push_back(p);
 
-          cv->set();
+            cv->set();
 
-          first_file_hashed_.erase(p->size());
+            first_file_hashed_.erase(p->size());
+          }
+        } catch (const std::exception& e) {
+          fprintf(stderr, "error hashing file %s: %s (skipping)\n",
+                  p->path_as_string().c_str(), e.what());
+          prog_.errors++;
+          {
+            std::lock_guard lock(mx_);
+            cv->set();
+            first_file_hashed_.erase(p->size());
+          }
+        } catch (...) {
+          fprintf(stderr, "unknown error hashing file %s (skipping)\n",
+                  p->path_as_string().c_str());
+          prog_.errors++;
+          {
+            std::lock_guard lock(mx_);
+            cv->set();
+            first_file_hashed_.erase(p->size());
+          }
         }
 
         cv->notify();
