@@ -59,16 +59,6 @@ uint64_t time_from_filetime(FILETIME const& ft) {
   return (ticks / FT_TICKS_PER_SECOND) - FT_EPOCH_OFFSET;
 }
 
-// GCC 16 (non-MSVC STL) changed symlink_status() to return file_type::directory
-// for NTFS directory junctions and directory symlinks, breaking mkdwarfs scanning.
-// Use the Windows API to detect reparse points and restore symlink semantics.
-bool is_windows_reparse_dir(fs::path const& path) {
-  DWORD attrs = ::GetFileAttributesW(path.wstring().c_str());
-  return attrs != INVALID_FILE_ATTRIBUTES &&
-         (attrs & FILE_ATTRIBUTE_REPARSE_POINT) &&
-         (attrs & FILE_ATTRIBUTE_DIRECTORY);
-}
-
 #endif
 
 } // namespace
@@ -78,12 +68,13 @@ bool is_windows_reparse_dir(fs::path const& path) {
 file_stat make_file_stat(fs::path const& path) {
   auto status = fs::symlink_status(path);
 
-  // GCC 16 reports file_type::directory for NTFS junctions/dir symlinks.
-  // Restore symlink semantics so mkdwarfs stores them as links, not directories.
-  if (status.type() == fs::file_type::directory &&
-      is_windows_reparse_dir(path)) {
-    status = fs::file_status(fs::file_type::symlink, status.permissions());
-  }
+  // Note: GCC 16 (MinGW-w64) reports file_type::directory for NTFS junction
+  // directories rather than file_type::symlink. We intentionally leave this
+  // as-is so the scanner recurses into tebako's staging junctions (local/,
+  // gems/3.4.0/, etc.) as directories. Inaccessible junctions (e.g. Ruby
+  // stdlib junctions via \\?\ prefix) are handled gracefully by the Win32
+  // FindFirstFileExW implementation in os_access_generic.cpp, which returns
+  // recoverable error codes rather than raising hardware exceptions.
 
   if (status.type() == fs::file_type::not_found ||
       status.type() == fs::file_type::unknown) {
