@@ -45,6 +45,15 @@
 
 namespace dwarfs {
 
+#ifdef _WIN32
+namespace detail {
+extern void win32_stat_cache_store(std::wstring const& path,
+                                   ::WIN32_FIND_DATAW const& data);
+extern bool win32_stat_cache_lookup(std::wstring const& path,
+                                    ::WIN32_FIND_DATAW& out);
+} // namespace detail
+#endif
+
 namespace {
 
 namespace fs = std::filesystem;
@@ -68,21 +77,20 @@ uint64_t time_from_filetime(FILETIME const& ft) {
 file_stat make_file_stat(fs::path const& path) {
   auto wps = path.wstring();
 
-  // Use FindFirstFileExW (NtOpenFile + NtQueryDirectoryFile) instead of
-  // GetFileAttributesW (NtQueryFullAttributesFile). Both GCC 16 MinGW's
-  // symlink_status() and GetFileAttributesW fail to resolve intermediate NTFS
-  // directory junctions in the path (e.g. lib/ruby/3.4.0/ in tebako's staging
-  // tree) because NtQueryFullAttributesFile does not follow them. FindFirstFileExW
-  // splits the path at the last separator, opens the parent directory (which
-  // DOES follow junctions), then queries the entry by name — the same internal
-  // mechanism used by generic_dir_reader to enumerate directory contents.
+  // Prefer the WIN32_FIND_DATA cached by generic_dir_reader::read() — that
+  // data came from FindFirstFileExW("dir\*") directory enumeration, which uses
+  // NtOpenFile+NtQueryDirectoryFile and follows NTFS junction directories in
+  // the path. Fallback to FindFirstFileExW(exact) only for paths not reached
+  // via the scanner's directory enumeration (e.g. the scan root itself).
   ::WIN32_FIND_DATAW fdata{};
-  HANDLE fh = ::FindFirstFileExW(wps.c_str(), FindExInfoBasic, &fdata,
-                                  FindExSearchNameMatch, nullptr, 0);
-  if (fh == INVALID_HANDLE_VALUE) {
-    DWARFS_THROW(system_error, u8string_to_string(path.u8string()), ENOENT);
+  if (!detail::win32_stat_cache_lookup(wps, fdata)) {
+    HANDLE fh = ::FindFirstFileExW(wps.c_str(), FindExInfoBasic, &fdata,
+                                    FindExSearchNameMatch, nullptr, 0);
+    if (fh == INVALID_HANDLE_VALUE) {
+      DWARFS_THROW(system_error, u8string_to_string(path.u8string()), ENOENT);
+    }
+    ::FindClose(fh);
   }
-  ::FindClose(fh);
 
   DWORD const attrs = fdata.dwFileAttributes;
   fs::file_status status;

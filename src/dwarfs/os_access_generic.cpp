@@ -23,6 +23,8 @@
 #include <windows.h>
 #endif
 
+#include <unordered_map>
+
 #include <folly/portability/Unistd.h>
 
 #include "dwarfs/mmap.h"
@@ -31,6 +33,13 @@
 namespace dwarfs {
 
 namespace fs = std::filesystem;
+
+#ifdef _WIN32
+namespace detail {
+void win32_stat_cache_store(std::wstring const& path,
+                            ::WIN32_FIND_DATAW const& data);
+} // namespace detail
+#endif
 
 namespace {
 
@@ -74,6 +83,7 @@ class generic_dir_reader final : public dir_reader {
       return false;
     }
     name = dir_path_ / data_.cFileName;
+    detail::win32_stat_cache_store(name.wstring(), data_);
     has_entry_ = false;
     while (::FindNextFileW(handle_, &data_)) {
       if (!is_dot()) {
@@ -136,6 +146,29 @@ class generic_dir_reader final : public dir_reader {
 #endif
 
 } // namespace
+
+#ifdef _WIN32
+namespace {
+thread_local std::unordered_map<std::wstring, ::WIN32_FIND_DATAW> g_win32_stat_cache;
+} // namespace
+
+namespace detail {
+void win32_stat_cache_store(std::wstring const& path,
+                            ::WIN32_FIND_DATAW const& data) {
+  g_win32_stat_cache[path] = data;
+}
+
+bool win32_stat_cache_lookup(std::wstring const& path,
+                             ::WIN32_FIND_DATAW& out) {
+  auto it = g_win32_stat_cache.find(path);
+  if (it == g_win32_stat_cache.end())
+    return false;
+  out = it->second;
+  g_win32_stat_cache.erase(it);
+  return true;
+}
+} // namespace detail
+#endif
 
 std::shared_ptr<dir_reader>
 os_access_generic::opendir(fs::path const& path) const {
