@@ -68,23 +68,27 @@ uint64_t time_from_filetime(FILETIME const& ft) {
 file_stat make_file_stat(fs::path const& path) {
   auto wps = path.wstring();
 
-  // Use GetFileAttributesW instead of fs::symlink_status(). GCC 16 MinGW's
-  // symlink_status() uses FILE_OPEN_REPARSE_POINT internally and does not
-  // follow NTFS directory junctions in intermediate path components, returning
-  // file_type::not_found for real files whose paths traverse a junction (e.g.
-  // lib/ruby/3.4.0/ in tebako's staging tree). GetFileAttributesW follows
-  // directory junctions transparently, consistent with FindFirstFileExW used in
-  // generic_dir_reader. GitHub Actions runners have LongPathsEnabled in the
-  // registry so we never need \\?\ for MAX_PATH bypass.
-  DWORD attrs = ::GetFileAttributesW(wps.c_str());
-  if (attrs == INVALID_FILE_ATTRIBUTES) {
+  // Use FindFirstFileExW (NtOpenFile + NtQueryDirectoryFile) instead of
+  // GetFileAttributesW (NtQueryFullAttributesFile). Both GCC 16 MinGW's
+  // symlink_status() and GetFileAttributesW fail to resolve intermediate NTFS
+  // directory junctions in the path (e.g. lib/ruby/3.4.0/ in tebako's staging
+  // tree) because NtQueryFullAttributesFile does not follow them. FindFirstFileExW
+  // splits the path at the last separator, opens the parent directory (which
+  // DOES follow junctions), then queries the entry by name — the same internal
+  // mechanism used by generic_dir_reader to enumerate directory contents.
+  ::WIN32_FIND_DATAW fdata{};
+  HANDLE fh = ::FindFirstFileExW(wps.c_str(), FindExInfoBasic, &fdata,
+                                  FindExSearchNameMatch, nullptr, 0);
+  if (fh == INVALID_HANDLE_VALUE) {
     DWARFS_THROW(system_error, u8string_to_string(path.u8string()), ENOENT);
   }
+  ::FindClose(fh);
 
+  DWORD const attrs = fdata.dwFileAttributes;
   fs::file_status status;
   if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) {
-    // NTFS junctions are reparse points with FILE_ATTRIBUTE_DIRECTORY set.
-    // Non-directory reparse points (symlinks to files) map to symlink type.
+    // NTFS junctions (reparse + directory): report as directory so the scanner
+    // recurses into them. Non-directory reparse points: report as symlink.
     if (attrs & FILE_ATTRIBUTE_DIRECTORY) {
       status = fs::file_status(fs::file_type::directory, fs::perms::all);
     } else {
@@ -100,30 +104,35 @@ file_stat make_file_stat(fs::path const& path) {
   rv.mode = file_status_to_mode(status);
   rv.blksize = 0;
   rv.blocks = 0;
+  rv.dev = 0;
+  rv.uid = 0;
+  rv.gid = 0;
+  rv.rdev = 0;
+  rv.ino = 0;
+  rv.nlink = 1;
+  rv.size = (static_cast<uint64_t>(fdata.nFileSizeHigh) << 32) + fdata.nFileSizeLow;
+  rv.atime = time_from_filetime(fdata.ftLastAccessTime);
+  rv.mtime = time_from_filetime(fdata.ftLastWriteTime);
+  rv.ctime = time_from_filetime(fdata.ftCreationTime);
 
   if (status.type() == fs::file_type::symlink) {
-    ::WIN32_FILE_ATTRIBUTE_DATA info;
-    if (::GetFileAttributesExW(wps.c_str(), GetFileExInfoStandard, &info) ==
-        0) {
-      throw std::system_error(::GetLastError(), std::system_category(),
-                              "GetFileAttributesExW");
-    }
-    rv.dev = 0;
-    rv.ino = 0;
-    rv.nlink = 0;
-    rv.uid = 0;
-    rv.gid = 0;
-    rv.rdev = 0;
-    rv.size =
-        (static_cast<uint64_t>(info.nFileSizeHigh) << 32) + info.nFileSizeLow;
-    rv.atime = time_from_filetime(info.ftLastAccessTime);
-    rv.mtime = time_from_filetime(info.ftLastWriteTime);
-    rv.ctime = time_from_filetime(info.ftCreationTime);
+    // Symlink stats are fully satisfied by WIN32_FIND_DATA above.
   } else {
+    // For non-symlinks, try _wstat64 to fill dev/uid/gid and, for regular
+    // files, try CreateFileW to get the inode number and link count (needed for
+    // hardlink deduplication). Both may fail for junction-traversal paths; in
+    // that case, the WIN32_FIND_DATA values (ino=0, nlink=1) are kept and
+    // hardlink deduplication is skipped for the file — it is still archived.
     struct ::__stat64 st;
-
-    if (::_wstat64(wps.c_str(), &st) != 0) {
-      throw std::system_error(errno, std::generic_category(), "_stat64");
+    if (::_wstat64(wps.c_str(), &st) == 0) {
+      rv.dev = st.st_dev;
+      rv.uid = st.st_uid;
+      rv.gid = st.st_gid;
+      rv.rdev = st.st_rdev;
+      rv.size = st.st_size;
+      rv.atime = st.st_atime;
+      rv.mtime = st.st_mtime;
+      rv.ctime = st.st_ctime;
     }
 
     if (status.type() == fs::file_type::regular) {
@@ -131,38 +140,16 @@ file_stat make_file_stat(fs::path const& path) {
           ::CreateFileW(wps.c_str(), 0, FILE_SHARE_READ, NULL, OPEN_EXISTING,
                         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, NULL);
 
-      if (hdl == INVALID_HANDLE_VALUE) {
-        throw std::system_error(::GetLastError(), std::system_category(),
-                                fmt::format("CreateFileW({})", path.string()));
+      if (hdl != INVALID_HANDLE_VALUE) {
+        ::BY_HANDLE_FILE_INFORMATION info;
+        if (::GetFileInformationByHandle(hdl, &info)) {
+          rv.ino = (static_cast<uint64_t>(info.nFileIndexHigh) << 32) +
+                   info.nFileIndexLow;
+          rv.nlink = info.nNumberOfLinks;
+        }
+        ::CloseHandle(hdl);
       }
-
-      ::BY_HANDLE_FILE_INFORMATION info;
-      if (!::GetFileInformationByHandle(hdl, &info)) {
-        throw std::system_error(::GetLastError(), std::system_category(),
-                                "GetFileInformationByHandle");
-      }
-
-      if (!::CloseHandle(hdl)) {
-        throw std::system_error(::GetLastError(), std::system_category(),
-                                "CloseHandle");
-      }
-
-      rv.ino = (static_cast<uint64_t>(info.nFileIndexHigh) << 32) +
-               info.nFileIndexLow;
-      rv.nlink = info.nNumberOfLinks;
-    } else {
-      rv.ino = st.st_ino;
-      rv.nlink = st.st_nlink;
     }
-
-    rv.dev = st.st_dev;
-    rv.uid = st.st_uid;
-    rv.gid = st.st_gid;
-    rv.rdev = st.st_rdev;
-    rv.size = st.st_size;
-    rv.atime = st.st_atime;
-    rv.mtime = st.st_mtime;
-    rv.ctime = st.st_ctime;
   }
 
   return rv;
