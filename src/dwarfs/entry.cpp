@@ -452,9 +452,11 @@ class entry_factory_ : public entry_factory {
   std::shared_ptr<entry>
   create(os_access& os, std::filesystem::path const& path,
          std::shared_ptr<entry> parent) override {
-    // TODO: just use `path` directly (need to fix test helpers, tho)?
-    std::filesystem::path p =
-        parent ? parent->fs_path() / path.filename() : path;
+    // Use `path` directly: it is always the full absolute path supplied by
+    // the scanner's dir_reader. Reconstructing via parent->fs_path() is
+    // unreliable on Windows when the parent weak_ptr chain is broken for
+    // junction directory entries (fs_path() falls back to the bare filename).
+    std::filesystem::path p = path;
 
     auto st = os.symlink_info(p);
 
