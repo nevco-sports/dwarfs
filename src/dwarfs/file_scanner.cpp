@@ -20,6 +20,7 @@
  */
 
 #include <cstdio>
+#include <filesystem>
 #include <mutex>
 #include <string_view>
 #include <vector>
@@ -68,7 +69,7 @@ class file_scanner_ : public file_scanner::impl {
   };
 
   void scan_dedupe(file* p);
-  void hash_file(file* p);
+  void hash_file(file* p, std::filesystem::path const& path);
   void add_inode(file* p);
 
   template <typename Lookup>
@@ -233,9 +234,13 @@ void file_scanner_::scan_dedupe(file* p) {
       }
 
       // Add a job for the first file
-      wg_.add_job([this, p = it->second.front(), cv] {
+      // Capture fs_path() synchronously: async workers can't call p->fs_path()
+      // safely because the parent_ weak_ptr chain may have expired by then (NTFS
+      // junction entries on Windows/GCC16).
+      auto first_path = it->second.front()->fs_path();
+      wg_.add_job([this, p = it->second.front(), cv, first_path] {
         try {
-          hash_file(p);
+          hash_file(p, first_path);
 
           {
             std::lock_guard lock(mx_);
@@ -278,9 +283,11 @@ void file_scanner_::scan_dedupe(file* p) {
     }
 
     // Add a job for any subsequent files
-    wg_.add_job([this, p, cv] {
+    // Capture fs_path() synchronously (see first-file comment above).
+    auto p_path = p->fs_path();
+    wg_.add_job([this, p, cv, p_path] {
       try {
-        hash_file(p);
+        hash_file(p, p_path);
 
         {
           std::unique_lock lock(mx_);
@@ -343,12 +350,12 @@ void file_scanner_::scan_dedupe(file* p) {
   }
 }
 
-void file_scanner_::hash_file(file* p) {
+void file_scanner_::hash_file(file* p, std::filesystem::path const& path) {
   auto const size = p->size();
   std::shared_ptr<mmif> mm;
 
   if (size > 0) {
-    mm = os_.map_file(p->fs_path(), size);
+    mm = os_.map_file(path, size);
   }
 
   prog_.current.store(p);
@@ -363,12 +370,16 @@ void file_scanner_::add_inode(file* p) {
   p->set_inode(inode);
 
   if (ino_opts_.needs_scan(p->size())) {
-    wg_.add_job([this, p, inode = std::move(inode)] {
+    // Capture fs_path() synchronously: async workers can't call p->fs_path()
+    // safely because the parent_ weak_ptr chain may have expired by then (NTFS
+    // junction entries on Windows/GCC16).
+    auto path = p->fs_path();
+    wg_.add_job([this, p, inode = std::move(inode), path] {
       try {
         std::shared_ptr<mmif> mm;
         auto const size = p->size();
         if (size > 0) {
-          mm = os_.map_file(p->fs_path(), size);
+          mm = os_.map_file(path, size);
         }
         inode->scan(mm.get(), ino_opts_);
         ++prog_.similarity_scans;
