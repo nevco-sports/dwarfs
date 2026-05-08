@@ -311,10 +311,33 @@ void file_scanner_::scan_dedupe(file* p) {
         fprintf(stderr, "error scanning file %s: %s (skipping)\n",
                 p->path_as_string().c_str(), e.what());
         prog_.errors++;
+        // hash_file threw before add_inode — p has no inode and is an orphan
+        // in its parent directory. Create a valid empty inode so finalization
+        // doesn't encounter a null inode and SIGSEGV.
+        {
+          std::lock_guard lock(mx_);
+          if (!p->get_inode()) {
+            auto inode = im_.create_inode();
+            p->set_inode(inode);
+            inode->set_similarity_valid(ino_opts_);
+            ++prog_.inodes_scanned;
+            ++prog_.files_scanned;
+          }
+        }
       } catch (...) {
         fprintf(stderr, "unknown error scanning file %s (skipping)\n",
                 p->path_as_string().c_str());
         prog_.errors++;
+        {
+          std::lock_guard lock(mx_);
+          if (!p->get_inode()) {
+            auto inode = im_.create_inode();
+            p->set_inode(inode);
+            inode->set_similarity_valid(ino_opts_);
+            ++prog_.inodes_scanned;
+            ++prog_.files_scanned;
+          }
+        }
       }
     });
   }
@@ -356,10 +379,16 @@ void file_scanner_::add_inode(file* p) {
         fprintf(stderr, "error scanning inode for %s: %s (skipping)\n",
                 p->path_as_string().c_str(), e.what());
         prog_.errors++;
+        inode->set_similarity_valid(ino_opts_);
+        ++prog_.inodes_scanned;
+        ++prog_.files_scanned;
       } catch (...) {
         fprintf(stderr, "unknown error scanning inode for %s (skipping)\n",
                 p->path_as_string().c_str());
         prog_.errors++;
+        inode->set_similarity_valid(ino_opts_);
+        ++prog_.inodes_scanned;
+        ++prog_.files_scanned;
       }
     });
   } else {
