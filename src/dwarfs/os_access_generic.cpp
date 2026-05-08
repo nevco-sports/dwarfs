@@ -19,6 +19,10 @@
  * along with dwarfs.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 #include <folly/portability/Unistd.h>
 
 #include "dwarfs/mmap.h"
@@ -29,6 +33,86 @@ namespace dwarfs {
 namespace fs = std::filesystem;
 
 namespace {
+
+#ifdef _WIN32
+
+// Use Win32 FindFirstFileExW/FindNextFileW directly instead of
+// std::filesystem::directory_iterator. On MinGW-w64 GCC 16, the
+// directory_iterator can cause STATUS_ACCESS_VIOLATION (SIGSEGV) when
+// iterating paths inside NTFS junction directories via the \\?\ prefix.
+// The Win32 API returns recoverable error codes instead of crashing.
+class generic_dir_reader final : public dir_reader {
+ public:
+  explicit generic_dir_reader(fs::path const& path) : dir_path_(path) {
+    std::wstring pattern = path.wstring() + L"\\*";
+    handle_ = ::FindFirstFileExW(pattern.c_str(), FindExInfoBasic, &data_,
+                                  FindExSearchNameMatch, nullptr, 0);
+    if (handle_ == INVALID_HANDLE_VALUE) {
+      DWORD err = ::GetLastError();
+      if (err == ERROR_FILE_NOT_FOUND || err == ERROR_NO_MORE_FILES) {
+        // directory is empty — valid state, no entries
+      } else if (err == ERROR_PATH_NOT_FOUND || err == ERROR_DIRECTORY ||
+                 err == ERROR_INVALID_NAME) {
+        throw std::system_error(ENOENT, std::generic_category(), path.string());
+      } else {
+        throw std::system_error(static_cast<int>(err), std::system_category(),
+                               "FindFirstFileExW: " + path.string());
+      }
+    } else {
+      advance_past_dots();
+    }
+  }
+
+  ~generic_dir_reader() {
+    if (handle_ != INVALID_HANDLE_VALUE) {
+      ::FindClose(handle_);
+    }
+  }
+
+  bool read(fs::path& name) override {
+    if (!has_entry_) {
+      return false;
+    }
+    name = dir_path_ / data_.cFileName;
+    has_entry_ = false;
+    while (::FindNextFileW(handle_, &data_)) {
+      if (!is_dot()) {
+        has_entry_ = true;
+        break;
+      }
+    }
+    if (!has_entry_) {
+      ::FindClose(handle_);
+      handle_ = INVALID_HANDLE_VALUE;
+    }
+    return true;
+  }
+
+ private:
+  bool is_dot() const {
+    const WCHAR* n = data_.cFileName;
+    return n[0] == L'.' &&
+           (n[1] == L'\0' || (n[1] == L'.' && n[2] == L'\0'));
+  }
+
+  void advance_past_dots() {
+    while (is_dot()) {
+      if (!::FindNextFileW(handle_, &data_)) {
+        ::FindClose(handle_);
+        handle_ = INVALID_HANDLE_VALUE;
+        return;
+      }
+    }
+    has_entry_ = true;
+  }
+
+  fs::path dir_path_;
+  HANDLE handle_{INVALID_HANDLE_VALUE};
+  WIN32_FIND_DATAW data_{};
+  bool has_entry_{false};
+};
+
+#else
 
 class generic_dir_reader final : public dir_reader {
  public:
@@ -48,6 +132,8 @@ class generic_dir_reader final : public dir_reader {
  private:
   fs::directory_iterator it_;
 };
+
+#endif
 
 } // namespace
 
