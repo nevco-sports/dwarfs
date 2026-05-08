@@ -185,10 +185,14 @@ std::filesystem::path canonical_path(std::filesystem::path p) {
     p = std::filesystem::absolute(p);
   }
 
-#ifdef _WIN32
-  p = std::filesystem::path(L"\\\\?\\" + p.wstring());
-#endif
-
+  // NOTE: We intentionally do NOT prepend \\?\ on Windows. The \\?\ prefix
+  // disables standard path processing and causes GetFileAttributesW / CreateFile
+  // to fail for paths that traverse NTFS junction directories (e.g. tebako's
+  // staging junctions local/, gems/3.4.0/, etc.) even though FindFirstFileExW
+  // can enumerate their contents. GitHub Actions Windows runners have long path
+  // support enabled natively (LongPathsEnabled registry key), so \\?\ is not
+  // needed for MAX_PATH bypass. Normal Win32 paths follow NTFS junctions
+  // transparently.
   return p;
 }
 
