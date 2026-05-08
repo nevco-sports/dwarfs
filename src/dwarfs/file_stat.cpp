@@ -77,19 +77,45 @@ uint64_t time_from_filetime(FILETIME const& ft) {
 file_stat make_file_stat(fs::path const& path) {
   auto wps = path.wstring();
 
-  // Prefer the WIN32_FIND_DATA cached by generic_dir_reader::read() — that
-  // data came from FindFirstFileExW("dir\*") directory enumeration, which uses
-  // NtOpenFile+NtQueryDirectoryFile and follows NTFS junction directories in
-  // the path. Fallback to FindFirstFileExW(exact) only for paths not reached
-  // via the scanner's directory enumeration (e.g. the scan root itself).
+  // Three-tier resolution strategy for NTFS junction-traversal paths:
+  // 1. Thread-local cache populated by generic_dir_reader::read() — zero cost,
+  //    covers the common case (all entries enumerated via wildcard FindFirst).
+  // 2. FindFirstFileExW(exact) — works for non-junction paths (e.g. scan root).
+  // 3. Parent directory enumeration fallback — FindFirstFileExW("parent\*") with
+  //    a case-insensitive filename scan. This uses NtOpenFile+NtQueryDirectoryFile
+  //    which follows NTFS junctions in intermediate path components, unlike
+  //    NtQueryFullAttributesFile (used by exact FindFirstFileExW and GetFileAttributesW).
   ::WIN32_FIND_DATAW fdata{};
   if (!detail::win32_stat_cache_lookup(wps, fdata)) {
     HANDLE fh = ::FindFirstFileExW(wps.c_str(), FindExInfoBasic, &fdata,
                                     FindExSearchNameMatch, nullptr, 0);
     if (fh == INVALID_HANDLE_VALUE) {
-      DWARFS_THROW(system_error, u8string_to_string(path.u8string()), ENOENT);
+      // Tier 3: enumerate parent directory to find this entry.
+      fs::path parent_path = path.parent_path();
+      std::wstring leaf = path.filename().wstring();
+      if (parent_path.empty() || leaf.empty()) {
+        DWARFS_THROW(system_error, u8string_to_string(path.u8string()), ENOENT);
+      }
+      std::wstring pattern = parent_path.wstring() + L"\\*";
+      HANDLE sh = ::FindFirstFileExW(pattern.c_str(), FindExInfoBasic, &fdata,
+                                      FindExSearchNameMatch, nullptr, 0);
+      if (sh == INVALID_HANDLE_VALUE) {
+        DWARFS_THROW(system_error, u8string_to_string(path.u8string()), ENOENT);
+      }
+      bool found = false;
+      do {
+        if (::_wcsicmp(fdata.cFileName, leaf.c_str()) == 0) {
+          found = true;
+          break;
+        }
+      } while (::FindNextFileW(sh, &fdata));
+      ::FindClose(sh);
+      if (!found) {
+        DWARFS_THROW(system_error, u8string_to_string(path.u8string()), ENOENT);
+      }
+    } else {
+      ::FindClose(fh);
     }
-    ::FindClose(fh);
   }
 
   DWORD const attrs = fdata.dwFileAttributes;
