@@ -66,27 +66,40 @@ uint64_t time_from_filetime(FILETIME const& ft) {
 #ifdef _WIN32
 
 file_stat make_file_stat(fs::path const& path) {
-  auto status = fs::symlink_status(path);
+  auto wps = path.wstring();
 
-  // Note: GCC 16 (MinGW-w64) reports file_type::directory for NTFS junction
-  // directories rather than file_type::symlink. We intentionally leave this
-  // as-is so the scanner recurses into tebako's staging junctions (local/,
-  // gems/3.4.0/, etc.) as directories. Inaccessible junctions (e.g. Ruby
-  // stdlib junctions via \\?\ prefix) are handled gracefully by the Win32
-  // FindFirstFileExW implementation in os_access_generic.cpp, which returns
-  // recoverable error codes rather than raising hardware exceptions.
-
-  if (status.type() == fs::file_type::not_found ||
-      status.type() == fs::file_type::unknown) {
+  // Use GetFileAttributesW instead of fs::symlink_status(). GCC 16 MinGW's
+  // symlink_status() uses FILE_OPEN_REPARSE_POINT internally and does not
+  // follow NTFS directory junctions in intermediate path components, returning
+  // file_type::not_found for real files whose paths traverse a junction (e.g.
+  // lib/ruby/3.4.0/ in tebako's staging tree). GetFileAttributesW follows
+  // directory junctions transparently, consistent with FindFirstFileExW used in
+  // generic_dir_reader. GitHub Actions runners have LongPathsEnabled in the
+  // registry so we never need \\?\ for MAX_PATH bypass.
+  DWORD attrs = ::GetFileAttributesW(wps.c_str());
+  if (attrs == INVALID_FILE_ATTRIBUTES) {
     DWARFS_THROW(system_error, u8string_to_string(path.u8string()), ENOENT);
+  }
+
+  fs::file_status status;
+  if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) {
+    // NTFS junctions are reparse points with FILE_ATTRIBUTE_DIRECTORY set.
+    // Non-directory reparse points (symlinks to files) map to symlink type.
+    if (attrs & FILE_ATTRIBUTE_DIRECTORY) {
+      status = fs::file_status(fs::file_type::directory, fs::perms::all);
+    } else {
+      status = fs::file_status(fs::file_type::symlink, fs::perms::all);
+    }
+  } else if (attrs & FILE_ATTRIBUTE_DIRECTORY) {
+    status = fs::file_status(fs::file_type::directory, fs::perms::all);
+  } else {
+    status = fs::file_status(fs::file_type::regular, fs::perms::all);
   }
 
   file_stat rv;
   rv.mode = file_status_to_mode(status);
   rv.blksize = 0;
   rv.blocks = 0;
-
-  auto wps = path.wstring();
 
   if (status.type() == fs::file_type::symlink) {
     ::WIN32_FILE_ATTRIBUTE_DATA info;
